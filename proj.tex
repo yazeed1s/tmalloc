@@ -1,0 +1,171 @@
+\documentclass[12pt,letterpaper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[expansion=false]{microtype}
+\usepackage{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{fancyhdr}
+\usepackage{titling}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{enumitem}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage[hidelinks]{hyperref}
+
+\setlist[enumerate]{itemsep=2pt, topsep=4pt, parsep=0pt, partopsep=0pt}
+\setlist[itemize]{itemsep=2pt, topsep=2pt, parsep=0pt, partopsep=0pt}
+\geometry{left=0.65in,right=0.65in,top=0.75in,bottom=0.75in}
+
+\title{CS 5204: Operating Systems \\ Individual Project Proposal (Revised)}
+\author{Yazeed Alharthi \\ Sam H. Noh, Professor}
+\date{Revised Proposal Due September 28, 2026}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{CS 5204}
+\fancyhead[C]{Individual Project Proposal (Revised)}
+\fancyhead[R]{Yazeed Alharthi}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{15pt}
+
+\newcommand{\proposalfield}[1]{%
+  \par\medskip\noindent\textbf{#1}\par\smallskip
+}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}
+  \rule{0.9\textwidth}{0.4pt}
+\end{center}
+
+\section*{Proposal Requirements}
+
+The individual project must be related to operating systems and must include a meaningful development/programming component. The proposal should explain:
+
+\begin{itemize}
+    \item how the project is related to operating systems,
+    \item the eventual goal of the project, and
+    \item an approximate timeline, including mid-semester milestones.
+\end{itemize}
+
+Permission to pursue an individual project is granted only after the proposal passes the proposal stage.
+
+\section*{Path to This Proposal}
+
+Before settling on this, I went through several other ideas, and I think the reasoning behind each one dropping out is worth summarizing here, since it is part of why I landed on this one.
+
+I have a deep, sustained interest in live media transport, and I first tried to combine that with operating systems directly, through a specific mechanism:
+
+\begin{itemize}
+    \item \textbf{A FUSE-based filesystem for immutable HLS segments.} The idea was to exploit the write-once/read-many/short-lived lifecycle of live segments to cut filesystem metadata overhead. I realized FUSE routes every operation through a userspace daemon via \texttt{/dev/fuse}, so any win I measured would just be FUSE's own overhead, not a real improvement over general-purpose filesystems.
+    \item \textbf{A \texttt{sendfile()}/\texttt{io\_uring} zero-copy origin server.} The idea was to replace the read/write serving loop to cut kernel/user copies and syscalls. I realized this only makes sense to build once I know that hop is actually where meaningful latency lives, versus encoder buffering or player-side margins, and I did not know that for any hop.
+\end{itemize}
+
+Each of these was me picking a specific OS-level mechanism to optimize before knowing how much that mechanism actually contributes to total latency. That realization led me to a follow-up proposal: instrument a live-streaming pipeline stage by stage, capture/encode, ingest/transmux/transcode, origin/CDN, player/render, and isolate exactly how much of glass-to-glass latency is attributable to the OS itself versus application/codec logic versus network physics, as a measured foundation the ideas above (and similar future ones) would need to be justified rather than just plausible.
+
+Working through that proposal to the point of a full write-up, I became convinced of something that I think is actually the same insight that has quietly motivated the industry's whole history of protocol-layer latency work (RTMP, SRT, LL-HLS, MoQ): the OS is reactive. It only spends syscalls, copies, and scheduling time on what the application above it asks for, frame sizes, chunking granularity, buffering choices, connection patterns, so its share of the latency budget is not an independent quantity so much as a downstream effect of application-level design decisions made above it. For that reason, I decided to go with another project I have been interested in for a while, which is the one below.
+
+\section*{Selected Project}
+
+\textbf{What it is.} A thread-safe general-purpose memory allocator in C, built by progressing through the classic list-backed designs, an implicit free list, then an explicit free list, then a segregated free list, benchmarked against glibc's \texttt{malloc}/\texttt{free} on speed and fragmentation at each stage. I will build it single-threaded first to get each stage correct, then add thread safety with a global lock, and finally add a thread-local caching front-end so that most allocations avoid the shared lock entirely. Each version is benchmarked against glibc under the same workloads.
+
+\textbf{Why this is an OS project.} This is the same progression real allocator design goes through: glibc's own allocator is a more elaborate version of the segregated-fit idea I am building toward. Memory allocation also sits exactly at the boundary the OS course cares about: how a program's requests for memory get translated into the small number of syscalls (\texttt{brk}/\texttt{mmap}) that actually talk to the kernel, and how much work an allocator can push onto itself to avoid making that boundary crossing more than it has to. Fragmentation and locking under concurrent allocation are also both classic OS-style resource management problems, just expressed inside a single process instead of across processes.
+
+\textbf{What I already know how to do.}
+\begin{itemize}
+    \item How the three stages build on each other: an implicit free list uses per-block headers to traverse every block, allocated or free, to find a fit.
+    \item An explicit free list threads pointers through only the free blocks, using the free payload itself to store next/prev, so search skips allocated blocks entirely.
+    \item A segregated free list is an array of explicit lists, one per size class, so search is close to O(1).
+    \item Boundary tags (headers on both allocated and free blocks) are what make O(1) coalescing possible, and they stay in place even after free-list pointers are added on top.
+    \item The naive path to thread safety is a single global lock around allocate/free.
+\end{itemize}
+
+\textbf{What I still have to figure out.}
+\begin{itemize}
+    \item How to size and grow the arena: a single large \texttt{mmap} up front versus growing on demand.
+    \item The exact size classes to use for the segregated stage, and what to do when a class's list is empty.
+    \item How to design a benchmark lab that measures both raw throughput and fragmentation (bytes requested versus bytes held) in a way that is comparable across all stages and against glibc.
+    \item How the thread-local caches should be bounded and flushed, and how to handle a block freed by a different thread than the one that allocated it.
+\end{itemize}
+\section*{Evaluation Methodology}
+
+I plan to test every version of the allocator with the same set of benchmarks, so the results can be compared fairly. My current plan is:
+
+\begin{itemize}
+    \item \textbf{Workloads.} Recorded sequences of allocations and frees (traces) with different mixes of block sizes, some simple synthetic tests, and, once the allocator is thread-safe, tests where several threads allocate and free at the same time, including cases where one thread frees memory that another thread allocated.
+    \item \textbf{Speed.} How many allocations and frees per second each version can handle, compared with glibc. For the multithreaded tests, I will try different numbers of threads (for example 1, 2, 4, and 8).
+    \item \textbf{Memory usage.} How much memory the allocator takes from the operating system compared with how much the program actually asked for. I still need to work out the most reliable way to get the same measurement for glibc.
+    \item \textbf{Correctness.} A checking function that walks through the heap and looks for mistakes, such as blocks that were not merged or corrupted block sizes. For the multithreaded versions, I will also use ThreadSanitizer to look for data races.
+\end{itemize}
+
+\section*{Timeline}
+
+\medskip
+\noindent
+\begin{tabularx}{\textwidth}{@{}p{1.25in}X@{}}
+\toprule
+\textbf{Dates} & \textbf{Work and deliverables} \\
+\midrule
+Sep 24 -- Oct 4 & Set up the testing program and the heap checker. Build the first version (implicit free list) and get it working correctly. First comparison with glibc Probably. \\
+\addlinespace
+Oct 5 -- Oct 13 & Build the second version (explicit free list) and compare it with the first version and glibc. Start deciding on the size classes for the third version. \\
+\addlinespace
+Oct 14 -- Oct 16 & Midterm exam week; less project work. \\
+\addlinespace
+Oct 17 -- Oct 27 & Build the third version (segregated free list) and compare all three versions with glibc. \\
+\addlinespace
+\textbf{Oct 29 (Thu)} & \textbf{Midterm checkpoint report:} results for all three versions compared with glibc, and what I learned about why each one is faster or slower. \\
+\addlinespace
+Oct 30 -- Nov 15 & Add \texttt{calloc} and \texttt{realloc}. Make the allocator thread-safe with a single lock, and test it with multiple threads against glibc. \\
+\addlinespace
+Nov 16 -- Nov 29 & Add per-thread caches (the idea from TCmalloc) and compare against the single-lock version and glibc. The Thanksgiving break gives me some extra time here if I fall behind. \\
+\addlinespace
+Nov 30 -- Dec 6 & Final benchmark runs, trying the allocator in real programs, and writing the final report. \\
+\addlinespace
+\textbf{Dec 8 (Tue)} & \textbf{Final report} submitted, with the source code and results. \\
+\bottomrule
+\end{tabularx}
+
+\section*{Expected Assessment}
+
+Each grade level includes everything listed for the levels below it.
+
+\proposalfield{A}
+\begin{itemize}
+    \item The per-thread caches work correctly, including when one thread frees memory allocated by another thread.
+    \item With multiple threads, the per-thread cache version is faster than my single-lock version.
+    \item The allocator works in a real program: I will use it in place of glibc's allocator in \href{https://github.com/yazeed1s/zwm}{\textbf{ZWM}}, an X11 window manager I wrote in C 4 years ago. zwm is single-threaded, and it uses a BSP tree, and a bunch of other datastructres to manage keybinds, rules, etc, so it is a good real-world test of the single-threaded design. The goal is to use it day to day without crashes.
+    \item The final report does not only show the numbers, but also explains why each version is faster or slower, using measurements such as how long free-list searches take and how often the allocator asks the kernel for more memory.
+\end{itemize}
+
+\proposalfield{B}
+\begin{itemize}
+    \item All three versions (implicit, explicit, segregated) pass all test traces with the heap checker turned on.
+    \item The single-lock version works correctly with multiple threads and is compared against glibc.
+    \item Speed and memory usage are reported for every version and for glibc, with an explanation of the results.
+    \item The midterm checkpoint and final reports are submitted on the dates above.
+\end{itemize}
+
+\proposalfield{C}
+\begin{itemize}
+    \item The segregated free list works in a single thread and is compared against glibc, but thread safety is missing or not properly tested.
+\end{itemize}
+
+\proposalfield{D or below}
+\begin{itemize}
+    \item Only the first one or two versions work, or there is no real comparison against glibc.
+\end{itemize}
+
+\section*{Stretch Goals and Out of Scope}
+
+\textbf{If time permits.} If I finish the per-thread caches early, I would like to try a version with one lock per size class, to see how much of the speedup comes just from having less lock contention. I may also look into giving unused memory back to the operating system.
+
+\textbf{Out of scope.} In the original proposal I mentioned NUMA-aware allocation. I have decided to drop it, since testing it properly needs hardware with multiple CPU sockets, and I would rather spend the time making the main allocator and its evaluation solid.
+
+\end{document}
