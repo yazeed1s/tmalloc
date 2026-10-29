@@ -1,0 +1,9 @@
+# smallest useful trace: alloc, write, free, reuse
+a 0 24
+a 1 100
+a 2 8
+f 1
+a 3 90
+f 0
+f 2
+f 3

@@ -1,0 +1,11 @@
+bench_*
+memlib_test
+*.o
+traces/gen/
+check_test_*
+.venv/
+build/
+__pycache__/
+tools/maxrss
+plan.md
+old/
